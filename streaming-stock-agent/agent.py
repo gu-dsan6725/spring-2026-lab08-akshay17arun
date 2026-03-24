@@ -179,6 +179,65 @@ def _get_company_info(
         }
 
 
+def _compare_stocks(
+    symbol1: str,
+    symbol2: str
+) -> Dict[str, Any]:
+    """Compare two stocks side-by-side.
+
+    Args:
+        symbol1: First stock symbol (e.g., 'AAPL')
+        symbol2: Second stock symbol (e.g., 'MSFT')
+
+    Returns:
+        Dictionary with comparison data for both stocks
+    """
+    def _format_market_cap(market_cap):
+        if market_cap is None:
+            return "N/A"
+        if market_cap >= 1e12:
+            return f"{market_cap / 1e12:.1f}T"
+        elif market_cap >= 1e9:
+            return f"{market_cap / 1e9:.1f}B"
+        elif market_cap >= 1e6:
+            return f"{market_cap / 1e6:.1f}M"
+        return str(market_cap)
+
+    def _get_stock_summary(symbol: str) -> Dict[str, Any]:
+        try:
+            stock = yf.Ticker(symbol.upper())
+            info = stock.info
+            current_price = info.get('currentPrice') or info.get('regularMarketPrice')
+            if current_price is None:
+                return {"error": f"Could not retrieve price for {symbol}", "symbol": symbol.upper()}
+            return {
+                "symbol": symbol.upper(),
+                "current_price": round(current_price, 2),
+                "company_name": info.get('longName', symbol.upper()),
+                "market_cap": _format_market_cap(info.get('marketCap'))
+            }
+        except Exception as e:
+            logger.error(f"Error fetching data for {symbol}: {e}")
+            return {"error": str(e), "symbol": symbol.upper()}
+
+    try:
+        stock1 = _get_stock_summary(symbol1)
+        stock2 = _get_stock_summary(symbol2)
+
+        return {
+            "comparison": {
+                "symbol1": symbol1.upper(),
+                "symbol2": symbol2.upper(),
+                "stock1": stock1,
+                "stock2": stock2
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Error comparing stocks {symbol1} and {symbol2}: {e}")
+        return {"error": str(e)}
+
+
 # Tool definitions for Strands agent
 STOCK_TOOLS = [
     {
@@ -230,6 +289,25 @@ STOCK_TOOLS = [
             "required": ["ticker"]
         },
         "function": _get_company_info
+    },
+    {
+        "name": "compare_stocks",
+        "description": "Compare two stocks side-by-side. Use this when the user asks to compare two stocks, wants to know which stock is better, or asks about differences between two companies.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "symbol1": {
+                    "type": "string",
+                    "description": "First stock symbol to compare"
+                },
+                "symbol2": {
+                    "type": "string",
+                    "description": "Second stock symbol to compare"
+                }
+            },
+            "required": ["symbol1", "symbol2"]
+        },
+        "function": _compare_stocks
     }
 ]
 
