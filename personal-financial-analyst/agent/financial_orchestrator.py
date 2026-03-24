@@ -9,10 +9,19 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 
-from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, AgentDefinition
+from claude_agent_sdk import (
+    ClaudeSDKClient,
+    ClaudeAgentOptions,
+    AgentDefinition,
+    AssistantMessage,
+    ResultMessage,
+    TextBlock,
+    PermissionResultAllow,
+)
 
 
 logging.basicConfig(
@@ -26,6 +35,22 @@ logger = logging.getLogger(__name__)
 DATA_DIR: Path = Path(__file__).parent.parent / "data"
 RAW_DATA_DIR: Path = DATA_DIR / "raw_data"
 AGENT_OUTPUTS_DIR: Path = DATA_DIR / "agent_outputs"
+
+
+def _load_prompt(filename: str) -> str:
+    """Load prompt from prompts directory."""
+    prompt_path = Path(__file__).parent / "prompts" / filename
+    return prompt_path.read_text()
+
+
+async def _auto_approve_all(
+    tool_name: str,
+    input_data: dict,
+    context
+) -> PermissionResultAllow:
+    """Auto-approve all tools without prompting."""
+    logger.debug(f"Auto-approving tool: {tool_name}")
+    return PermissionResultAllow()
 
 
 def _ensure_directories():
@@ -69,6 +94,36 @@ def _detect_subscriptions(
     # TODO: Implement subscription detection logic
     # Hint: Look for transactions with recurring=True
     # Hint: Subscriptions are typically negative amounts (outflows)
+    seen = set()
+
+    all_transactions = [
+        (t, "bank") for t in bank_transactions
+    ] + [
+        (t, "credit_card") for t in credit_card_transactions
+    ]
+
+    for transaction, _ in all_transactions:
+        # Filter transactions marked as recurring
+        if not transaction.get("recurring", False):
+            continue
+        # Subscriptions are outflows (negative amounts)
+        if transaction.get("amount", 0) >= 0:
+            continue
+
+        # Deduplicate by description + amount
+        key = (transaction.get("description", "").strip().lower(), transaction.get("amount"))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        subscriptions.append({
+            "service": transaction.get("description", "Unknown"),
+            "amount": abs(transaction.get("amount", 0)),
+            "frequency": "monthly",
+        })
+
+    total_monthly = sum(s["amount"] for s in subscriptions)
+    logger.info(f"Total monthly subscription cost: ${total_monthly:.2f}")
 
     return subscriptions
 
@@ -110,8 +165,59 @@ async def _fetch_financial_data(
     # }
 
     # TODO: Call MCP tools to fetch data
-    bank_data = {}  # Placeholder
-    credit_card_data = {}  # Placeholder
+    mcp_servers = {
+        "Bank Account Server": {
+            "type": "http",
+            "url": "http://127.0.0.1:5001/mcp"
+        },
+        "Credit Card Server": {
+            "type": "http",
+            "url": "http://127.0.0.1:5002/mcp"
+        }
+    }
+
+    working_dir = Path(__file__).parent.parent
+
+    fetch_options = ClaudeAgentOptions(
+        model="haiku",
+        system_prompt="You are a data fetching agent. Call the requested MCP tools and output ONLY a valid JSON object with keys 'bank_data' and 'credit_card_data' containing the raw tool results. No explanation, no markdown, just JSON.",
+        mcp_servers=mcp_servers,
+        can_use_tool=_auto_approve_all,
+        cwd=str(working_dir)
+    )
+
+    bank_data = {}
+    credit_card_data = {}
+
+    async with ClaudeSDKClient(options=fetch_options) as client:
+        fetch_prompt = (
+            f'Call get_bank_transactions(username="{username}", start_date="{start_date}", end_date="{end_date}") '
+            f'and get_credit_card_transactions(username="{username}", start_date="{start_date}", end_date="{end_date}"). '
+            'Output the results as a JSON object: {"bank_data": <bank result>, "credit_card_data": <credit card result>}'
+        )
+        await client.query(fetch_prompt)
+
+        raw_text = ""
+        async for message in client.receive_response():
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        raw_text += block.text
+            elif isinstance(message, ResultMessage):
+                break
+
+    try:
+        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if match:
+            results = json.loads(match.group())
+            bank_data = results.get("bank_data", {})
+            credit_card_data = results.get("credit_card_data", {})
+            logger.info(f"Fetched {len(bank_data.get('transactions', []))} bank transactions")
+            logger.info(f"Fetched {len(credit_card_data.get('transactions', []))} credit card transactions")
+        else:
+            logger.error(f"No JSON found in fetch response: {raw_text[:200]}")
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse fetch results as JSON: {e}\nRaw: {raw_text[:200]}")
 
     # Save raw data
     _save_json(bank_data, "bank_transactions.json")
@@ -181,10 +287,31 @@ async def _run_orchestrator(
     #     model="haiku"  # Fast and cheap for research
     # )
 
+    research_agent = AgentDefinition(
+        description="Research cheaper alternatives for subscriptions and services",
+        prompt=_load_prompt("research_agent_prompt.txt"),
+        tools=["write"],
+        model="haiku"
+    )
+
+    negotiation_agent = AgentDefinition(
+        description="Create negotiation strategies and scripts for bills and services",
+        prompt=_load_prompt("negotiation_agent_prompt.txt"),
+        tools=["write"],
+        model="haiku"
+    )
+
+    tax_agent = AgentDefinition(
+        description="Identify tax-deductible expenses and optimization opportunities",
+        prompt=_load_prompt("tax_agent_prompt.txt"),
+        tools=["write"],
+        model="haiku"
+    )
+
     agents = {
-        # "research_agent": research_agent,
-        # "negotiation_agent": negotiation_agent,
-        # "tax_agent": tax_agent,
+        "research_agent": research_agent,
+        "negotiation_agent": negotiation_agent,
+        "tax_agent": tax_agent,
     }
 
     # Step 4: Configure orchestrator agent with sub-agents
@@ -198,6 +325,28 @@ async def _run_orchestrator(
     #     agents=agents,
     #     # Add MCP server configurations here
     # )
+
+    mcp_servers = {
+        "Bank Account Server": {
+            "type": "http",
+            "url": "http://127.0.0.1:5001/mcp"
+        },
+        "Credit Card Server": {
+            "type": "http",
+            "url": "http://127.0.0.1:5002/mcp"
+        }
+    }
+
+    working_dir = Path(__file__).parent.parent  # personal-financial-analyst/
+
+    options = ClaudeAgentOptions(
+        model="sonnet",
+        system_prompt=_load_prompt("orchestrator_system_prompt.txt"),
+        mcp_servers=mcp_servers,
+        agents=agents,
+        can_use_tool=_auto_approve_all,
+        cwd=str(working_dir)
+    )
 
     # Step 5: Run orchestrator with Claude Agent SDK
     # TODO: Use ClaudeSDKClient to run the orchestration
@@ -222,8 +371,37 @@ async def _run_orchestrator(
     #         if message.type == "assistant":
     #             print(message.content)
 
+    prompt = f"""Analyze my financial data and {user_query}
+
+I have:
+- {len(bank_transactions)} bank transactions
+- {len(credit_card_transactions)} credit card transactions
+- {len(subscriptions)} identified subscriptions
+
+Please:
+1. Identify opportunities for savings
+2. Delegate research to the research agent
+3. Delegate negotiation strategies to the negotiation agent
+4. Delegate tax analysis to the tax agent
+5. Read their results and create a final report at data/final_report.md
+"""
+
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query(prompt)
+
+        async for message in client.receive_response():
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        print(block.text, end='', flush=True)
+                print("\n", flush=True)
+            elif isinstance(message, ResultMessage):
+                logger.info(f"Duration: {message.duration_ms}ms")
+                logger.info(f"Cost: ${message.total_cost_usd:.4f}")
+                break
+
     # Step 6: Generate final report
-    logger.info("Orchestration complete. Check data/final_report.txt for results.")
+    logger.info("Orchestration complete. Check data/final_report.md for results.")
 
 
 def _parse_args() -> argparse.Namespace:
